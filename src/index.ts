@@ -1,9 +1,23 @@
-﻿import express from "express";
+﻿import http from "node:http";
+import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { randomUUID } from "node:crypto";
+import { WebSocketServer, type WebSocket } from "ws";
+import {
+  createRoomMap,
+  joinRoom,
+  leaveAllRooms,
+  relayRoom
+} from "./signalRooms.js";
+import {
+  dequeueRandom,
+  enqueueRandom,
+  getLobby,
+  leaveLobbyMember
+} from "./matchRandom.js";
 
 dotenv.config();
 
@@ -85,6 +99,13 @@ function validateHandle(handle: string) {
   return t.length >= 2 && t.length <= 32 && /^[a-zA-Z0-9_-]+$/.test(t);
 }
 
+function authUser(req: express.Request): string | null {
+  const hdr = req.headers.authorization;
+  const tok = hdr?.startsWith("Bearer ") ? hdr.slice(7) : null;
+  if (!tok) return null;
+  return verifyUserId(tok);
+}
+
 app.use(
   cors({
     origin(origin, callback) {
@@ -100,7 +121,7 @@ app.use(
 app.use(express.json());
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "express-backend" });
+  res.json({ ok: true, service: "express-backend", wsPath: "/ws" });
 });
 
 app.post("/api/auth/register", (req, res) => {
@@ -181,6 +202,139 @@ app.get("/api/me", (req, res) => {
   res.json(publicUser(u));
 });
 
-app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
+app.post("/api/lobbies/:id/leave", (req, res) => {
+  const uid = authUser(req);
+  if (!uid) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  const lobbyId = req.params.id;
+  leaveLobbyMember(lobbyId, uid);
+  res.json({ ok: true });
+});
+
+app.get("/api/lobbies/:id/roster", (req, res) => {
+  const uid = authUser(req);
+  if (!uid) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  const lobby = getLobby(req.params.id);
+  if (!lobby || !lobby.memberIds.includes(uid)) {
+    res.status(403).json({ error: "forbidden" });
+    return;
+  }
+  res.json({
+    lobbyId: lobby.id,
+    code: lobby.code,
+    creatorId: lobby.creatorId,
+    members: lobby.memberIds.map((idm) => {
+      const pu = usersById.get(idm);
+      return pu
+        ? {
+            id: pu.id,
+            email: pu.email,
+            handle: pu.handle,
+            avatarUrl: pu.avatarUrl,
+            bio: pu.bio,
+            isSelf: idm === uid,
+            isFriend: false
+          }
+        : null;
+    }).filter(Boolean)
+  });
+});
+
+const rtcRooms = createRoomMap();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+wss.on("connection", (ws: WebSocket) => {
+  let uid: string | null = null;
+  let currentRoom: string | null = null;
+
+  ws.on("message", (raw) => {
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(String(raw));
+    } catch {
+      return;
+    }
+    const t = msg.type as string | undefined;
+
+    if (t === "auth") {
+      const token = typeof msg.token === "string" ? msg.token : "";
+      const p = verifyUserId(token);
+      if (!p) {
+        ws.send(JSON.stringify({ type: "auth_error" }));
+        return;
+      }
+      uid = p;
+      ws.send(JSON.stringify({ type: "auth_ok" }));
+      return;
+    }
+
+    if (!uid) return;
+
+    if (t === "rtc_join") {
+      const roomKey = typeof msg.room === "string" ? msg.room : "";
+      if (!roomKey.startsWith("lobby:")) return;
+      const lobbyId = roomKey.slice("lobby:".length);
+      const lobby = getLobby(lobbyId);
+      if (!lobby?.memberIds.includes(uid)) {
+        ws.send(JSON.stringify({ type: "rtc_error", error: "forbidden_room" }));
+        return;
+      }
+      joinRoom(rtcRooms, roomKey, uid, ws, currentRoom);
+      currentRoom = roomKey;
+      const peers = [...(rtcRooms.get(roomKey)?.keys() ?? [])].filter(
+        (id) => id !== uid
+      );
+      ws.send(
+        JSON.stringify({ type: "rtc_joined", room: roomKey, peers })
+      );
+      return;
+    }
+
+    if (t === "rtc" && currentRoom) {
+      relayRoom(rtcRooms, currentRoom, uid, msg);
+      return;
+    }
+
+    if (t === "rtc_leave" && currentRoom) {
+      relayRoom(rtcRooms, currentRoom, uid, { type: "rtc_peer_left" });
+      rtcRooms.get(currentRoom)?.delete(uid);
+      currentRoom = null;
+      return;
+    }
+
+    if (t === "chat" && currentRoom) {
+      relayRoom(rtcRooms, currentRoom, uid, msg);
+      return;
+    }
+
+    if (t === "random_join") {
+      enqueueRandom(uid, ws);
+      ws.send(JSON.stringify({ type: "random_queued" }));
+      return;
+    }
+
+    if (t === "random_leave") {
+      dequeueRandom(uid);
+    }
+  });
+
+  ws.on("close", () => {
+    if (uid && currentRoom) {
+      relayRoom(rtcRooms, currentRoom, uid, { type: "rtc_peer_left" });
+    }
+    leaveAllRooms(rtcRooms, ws);
+    if (uid) {
+      dequeueRandom(uid);
+    }
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`API + WS on http://localhost:${PORT}`);
 });
