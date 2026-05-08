@@ -15,8 +15,11 @@ import {
 import {
   dequeueRandom,
   enqueueRandom,
+  createHostedLobby,
   getLobby,
+  joinHostedLobby,
   leaveLobbyMember,
+  resolveRandomQueueKey,
 } from "./matchRandom.js";
 import {
   closeUserStore,
@@ -236,14 +239,6 @@ function mountRoutes(store: UserStore, persistence: PersistenceMode) {
     }
 
     try {
-      if (typeof handle === "string") {
-        const hn = normalizeHandle(handle);
-        if (await store.isHandleTakenByOther(uid, hn)) {
-          res.status(409).json({ error: "handle_taken" });
-          return;
-        }
-      }
-
       const patch: {
         handle?: string;
         bio?: string;
@@ -252,6 +247,17 @@ function mountRoutes(store: UserStore, persistence: PersistenceMode) {
       if (typeof handle === "string") patch.handle = handle.trim();
       if (typeof bio === "string") patch.bio = bio;
       if (avatarUrl !== undefined) patch.avatarUrl = avatarTrim;
+
+      if (typeof handle === "string") {
+        const hn = normalizeHandle(handle);
+        const current = await store.findById(uid);
+        const sameHandle =
+          current && normalizeHandle(current.handle) === hn;
+        if (!sameHandle && (await store.isHandleTakenByOther(uid, hn))) {
+          res.status(409).json({ error: "handle_taken" });
+          return;
+        }
+      }
 
       const u = await store.applyProfilePatch(uid, patch);
       if (!u) {
@@ -267,6 +273,48 @@ function mountRoutes(store: UserStore, persistence: PersistenceMode) {
       console.error(e);
       res.status(500).json({ error: "server_error" });
     }
+  });
+
+  app.post("/api/lobbies", async (req, res) => {
+    const uid = authUser(req);
+    if (!uid) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+    const raw = (req.body as { maxParticipants?: unknown })?.maxParticipants;
+    const maxParticipants =
+      typeof raw === "number" && Number.isFinite(raw) ? raw : 8;
+    const lobby = createHostedLobby(uid, maxParticipants);
+    res.json({
+      lobbyId: lobby.id,
+      code: lobby.code,
+      signalingRoom: `lobby:${lobby.id}`,
+    });
+  });
+
+  app.post("/api/lobbies/join", async (req, res) => {
+    const uid = authUser(req);
+    if (!uid) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+    const code = (req.body as { code?: unknown })?.code;
+    if (typeof code !== "string" || code.trim().length < 4) {
+      res.status(400).json({ error: "invalid_body" });
+      return;
+    }
+    const r = joinHostedLobby(uid, code);
+    if (!r.ok) {
+      if (r.error === "not_found") res.status(404).json({ error: "not_found" });
+      else res.status(403).json({ error: "lobby_full" });
+      return;
+    }
+    const lobby = r.lobby;
+    res.json({
+      lobbyId: lobby.id,
+      code: lobby.code,
+      signalingRoom: `lobby:${lobby.id}`,
+    });
   });
 
   app.post("/api/lobbies/:id/leave", (req, res) => {
@@ -384,7 +432,8 @@ wss.on("connection", (ws: WebSocket) => {
     }
 
     if (t === "random_join") {
-      enqueueRandom(uid, ws);
+      const queueKey = resolveRandomQueueKey(uid, msg.lobbyId);
+      enqueueRandom(uid, ws, queueKey);
       ws.send(JSON.stringify({ type: "random_queued" }));
       return;
     }
