@@ -381,14 +381,33 @@ export async function createUserStore(): Promise<{
   mode: PersistenceMode;
 }> {
   if (process.env.MONGODB_URI) {
-    mongoClient = new MongoClient(process.env.MONGODB_URI);
-    await mongoClient.connect();
-    const dbName = process.env.MONGODB_DB ?? "etometv";
-    const db = mongoClient.db(dbName);
-    const store = new MongoUserStore(db.collection<MongoUserDoc>("users"));
-    await store.ensureIndexes();
-    await store.seedDemoIfMissing();
-    return { store, mode: "mongodb" };
+    const uri = process.env.MONGODB_URI.trim();
+    try {
+      mongoClient = new MongoClient(uri, {
+        connectTimeoutMS: 60_000,
+        serverSelectionTimeoutMS: 60_000,
+        maxPoolSize: 10,
+      });
+      await mongoClient.connect();
+      const dbName = process.env.MONGODB_DB ?? "etometv";
+      const db = mongoClient.db(dbName);
+      await db.command({ ping: 1 });
+      const store = new MongoUserStore(db.collection<MongoUserDoc>("users"));
+      await store.ensureIndexes();
+      await store.seedDemoIfMissing();
+      return { store, mode: "mongodb" };
+    } catch (e) {
+      console.error(
+        "[EtomeTv] MongoDB connection failed; falling back to in-memory users (not persistent).",
+        "Fix Atlas: resume cluster, Network Access 0.0.0.0/0, URL-encode password in MONGODB_URI.",
+        e
+      );
+      await mongoClient?.close().catch(() => {});
+      mongoClient = null;
+      const store = new MemoryUserStore();
+      await store.seedDemoIfMissing();
+      return { store, mode: "memory" };
+    }
   }
 
   if (process.env.DATABASE_URL) {
