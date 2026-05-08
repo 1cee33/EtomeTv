@@ -9,7 +9,7 @@ export type Lobby = {
   memberIds: string[];
 };
 
-type Waiter = { userId: string; ws: WebSocket };
+type Waiter = { userId: string; ws: WebSocket; interests: string[] };
 
 /** Pairing queues: `__global__` or `lobby:<id>` for lobby-only matching. */
 const queues = new Map<string, Waiter[]>();
@@ -45,14 +45,41 @@ export function resolveRandomQueueKey(
 export function enqueueRandom(
   userId: string,
   ws: WebSocket,
-  queueKey: string
+  queueKey: string,
+  interestsRaw?: unknown,
+  onPaired?: (pair: { lobbyId: string; users: [string, string] }) => void
 ) {
   const q = getQueue(queueKey);
+  const interests = Array.isArray(interestsRaw)
+    ? interestsRaw
+        .filter((v): v is string => typeof v === "string")
+        .map((v) => v.trim().toLowerCase())
+        .filter(Boolean)
+        .slice(0, 10)
+    : [];
   if (q.some((w) => w.userId === userId)) return;
-  q.push({ userId, ws });
+  q.push({ userId, ws, interests });
   while (q.length >= 2) {
     const A = q.shift()!;
-    const B = q.shift()!;
+    let bi = -1;
+    for (let i = 0; i < q.length; i++) {
+      const cand = q[i]!;
+      const hasSharedInterest =
+        A.interests.length > 0 &&
+        cand.interests.length > 0 &&
+        A.interests.some((t) => cand.interests.includes(t));
+      const fallbackNoPrefs = A.interests.length === 0 || cand.interests.length === 0;
+      if (hasSharedInterest || fallbackNoPrefs) {
+        bi = i;
+        break;
+      }
+    }
+    if (bi < 0) {
+      q.push(A);
+      break;
+    }
+    const [B] = q.splice(bi, 1);
+    if (!B) break;
     if (A.ws.readyState !== 1) {
       if (B.ws.readyState === 1) q.unshift(B);
       continue;
@@ -82,6 +109,7 @@ export function enqueueRandom(
     };
     send(A.ws, payload);
     send(B.ws, payload);
+    onPaired?.({ lobbyId: lobby.id, users: [A.userId, B.userId] });
   }
 }
 

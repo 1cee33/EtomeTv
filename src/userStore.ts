@@ -9,6 +9,10 @@ export type UserRow = {
   handle: string;
   avatarUrl: string;
   bio: string;
+  status: "online" | "away" | "in_call";
+  gender: string;
+  country: string;
+  interests: string[];
 };
 
 export function publicUser(u: UserRow) {
@@ -18,12 +22,18 @@ export function publicUser(u: UserRow) {
     handle: u.handle,
     avatarUrl: u.avatarUrl,
     bio: u.bio,
+    status: u.status,
+    gender: u.gender,
+    country: u.country,
+    interests: u.interests,
   };
 }
 
 export interface UserStore {
   findByEmailLc(emailLc: string): Promise<UserRow | null>;
   findById(id: string): Promise<UserRow | null>;
+  findByHandleNorm(handleNorm: string): Promise<UserRow | null>;
+  searchByHandle(queryNorm: string, limit: number): Promise<UserRow[]>;
   /** True if email or normalized handle is already used. */
   isEmailOrHandleTaken(emailLc: string, handleNorm: string): Promise<boolean>;
   /** Another user (not excludeUserId) already uses this normalized handle. */
@@ -34,7 +44,15 @@ export interface UserStore {
   createUser(row: UserRow): Promise<void>;
   applyProfilePatch(
     userId: string,
-    patch: { handle?: string; bio?: string; avatarUrl?: string }
+    patch: {
+      handle?: string;
+      bio?: string;
+      avatarUrl?: string;
+      status?: "online" | "away" | "in_call";
+      gender?: string;
+      country?: string;
+      interests?: string[];
+    }
   ): Promise<UserRow | null>;
 }
 
@@ -46,6 +64,10 @@ type MongoUserDoc = {
   handleNorm: string;
   avatarUrl: string;
   bio: string;
+  status: "online" | "away" | "in_call";
+  gender: string;
+  country: string;
+  interests: string[];
   createdAt: number;
 };
 
@@ -57,6 +79,10 @@ function mongoDocToRow(doc: MongoUserDoc): UserRow {
     handle: doc.handle,
     avatarUrl: doc.avatarUrl,
     bio: doc.bio,
+    status: doc.status,
+    gender: doc.gender,
+    country: doc.country,
+    interests: doc.interests ?? [],
   };
 }
 
@@ -76,6 +102,44 @@ export class MongoUserStore implements UserStore {
   async findById(id: string): Promise<UserRow | null> {
     const doc = await this.users.findOne({ _id: id });
     return doc ? mongoDocToRow(doc) : null;
+  }
+
+  async findByHandleNorm(handleNorm: string): Promise<UserRow | null> {
+    const doc = await this.users.findOne({
+      $or: [{ handleNorm }, { handle: { $regex: `^${handleNorm}$`, $options: "i" } }],
+    });
+    return doc ? mongoDocToRow(doc) : null;
+  }
+
+  async searchByHandle(queryNorm: string, limit: number): Promise<UserRow[]> {
+    if (!queryNorm) return [];
+    const escaped = queryNorm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const prefix = new RegExp(`^${escaped}`, "i");
+    const contains = new RegExp(escaped, "i");
+    const exact = await this.users.findOne({ handleNorm: queryNorm });
+    const pref = await this.users
+      .find({ handle: { $regex: prefix } })
+      .limit(Math.max(0, limit))
+      .toArray();
+    const remaining = Math.max(0, limit - pref.length - (exact ? 1 : 0));
+    const extra =
+      remaining > 0
+        ? await this.users
+            .find({ handle: { $regex: contains } })
+            .limit(remaining + 4)
+            .toArray()
+        : [];
+    const out: UserRow[] = [];
+    const seen = new Set<string>();
+    const add = (d: MongoUserDoc | null) => {
+      if (!d || seen.has(d._id) || out.length >= limit) return;
+      seen.add(d._id);
+      out.push(mongoDocToRow(d));
+    };
+    add(exact);
+    pref.forEach(add);
+    extra.forEach(add);
+    return out;
   }
 
   async isEmailOrHandleTaken(
@@ -108,6 +172,10 @@ export class MongoUserStore implements UserStore {
       handleNorm: row.handle.trim().toLowerCase(),
       avatarUrl: row.avatarUrl,
       bio: row.bio,
+      status: row.status,
+      gender: row.gender,
+      country: row.country,
+      interests: row.interests,
       createdAt: Date.now(),
     };
     await this.users.insertOne(d);
@@ -125,20 +193,36 @@ export class MongoUserStore implements UserStore {
       handle: "testuser",
       avatarUrl: "",
       bio: "",
+      status: "online",
+      gender: "",
+      country: "",
+      interests: [],
     });
   }
 
   async applyProfilePatch(
     userId: string,
-    patch: { handle?: string; bio?: string; avatarUrl?: string }
+    patch: {
+      handle?: string;
+      bio?: string;
+      avatarUrl?: string;
+      status?: "online" | "away" | "in_call";
+      gender?: string;
+      country?: string;
+      interests?: string[];
+    }
   ): Promise<UserRow | null> {
-    const $set: Record<string, string> = {};
+    const $set: Record<string, string | string[]> = {};
     if (patch.handle !== undefined) {
       $set.handle = patch.handle;
       $set.handleNorm = patch.handle.trim().toLowerCase();
     }
     if (patch.bio !== undefined) $set.bio = patch.bio;
     if (patch.avatarUrl !== undefined) $set.avatarUrl = patch.avatarUrl;
+    if (patch.status !== undefined) $set.status = patch.status;
+    if (patch.gender !== undefined) $set.gender = patch.gender;
+    if (patch.country !== undefined) $set.country = patch.country;
+    if (patch.interests !== undefined) $set.interests = patch.interests;
     if (Object.keys($set).length === 0) return this.findById(userId);
     const r = await this.users.updateOne({ _id: userId }, { $set });
     if (r.matchedCount === 0) return null;
@@ -176,6 +260,10 @@ async function ensureSchema(pool: Pool): Promise<void> {
       handle TEXT NOT NULL,
       avatar_url TEXT NOT NULL DEFAULT '',
       bio TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'online',
+      gender TEXT NOT NULL DEFAULT '',
+      country TEXT NOT NULL DEFAULT '',
+      interests_json TEXT NOT NULL DEFAULT '[]',
       created_at BIGINT NOT NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS users_handle_lower_idx ON users (LOWER(handle));
@@ -189,7 +277,20 @@ function rowFromPg(r: {
   handle: string;
   avatar_url: string;
   bio: string;
+  status: "online" | "away" | "in_call";
+  gender: string;
+  country: string;
+  interests_json: string;
 }): UserRow {
+  let interests: string[] = [];
+  try {
+    const parsed = JSON.parse(r.interests_json);
+    if (Array.isArray(parsed)) {
+      interests = parsed.filter((x): x is string => typeof x === "string");
+    }
+  } catch {
+    interests = [];
+  }
   return {
     id: r.id,
     email: r.email,
@@ -197,6 +298,10 @@ function rowFromPg(r: {
     handle: r.handle,
     avatarUrl: r.avatar_url,
     bio: r.bio,
+    status: r.status ?? "online",
+    gender: r.gender ?? "",
+    country: r.country ?? "",
+    interests,
   };
 }
 
@@ -205,7 +310,7 @@ export class PgUserStore implements UserStore {
 
   async findByEmailLc(emailLc: string): Promise<UserRow | null> {
     const { rows } = await this.pool.query(
-      `SELECT id, email, password_hash, handle, avatar_url, bio FROM users WHERE email = $1 LIMIT 1`,
+      `SELECT id, email, password_hash, handle, avatar_url, bio, status, gender, country, interests_json FROM users WHERE email = $1 LIMIT 1`,
       [emailLc]
     );
     return rows[0] ? rowFromPg(rows[0] as never) : null;
@@ -213,10 +318,39 @@ export class PgUserStore implements UserStore {
 
   async findById(id: string): Promise<UserRow | null> {
     const { rows } = await this.pool.query(
-      `SELECT id, email, password_hash, handle, avatar_url, bio FROM users WHERE id = $1 LIMIT 1`,
+      `SELECT id, email, password_hash, handle, avatar_url, bio, status, gender, country, interests_json FROM users WHERE id = $1 LIMIT 1`,
       [id]
     );
     return rows[0] ? rowFromPg(rows[0] as never) : null;
+  }
+
+  async findByHandleNorm(handleNorm: string): Promise<UserRow | null> {
+    const { rows } = await this.pool.query(
+      `SELECT id, email, password_hash, handle, avatar_url, bio, status, gender, country, interests_json FROM users WHERE LOWER(handle) = $1 LIMIT 1`,
+      [handleNorm]
+    );
+    return rows[0] ? rowFromPg(rows[0] as never) : null;
+  }
+
+  async searchByHandle(queryNorm: string, limit: number): Promise<UserRow[]> {
+    if (!queryNorm) return [];
+    const likePrefix = `${queryNorm}%`;
+    const likeContains = `%${queryNorm}%`;
+    const { rows } = await this.pool.query(
+      `SELECT id, email, password_hash, handle, avatar_url, bio, status, gender, country, interests_json
+       FROM users
+       WHERE LOWER(handle) LIKE $1 OR LOWER(handle) LIKE $2
+       ORDER BY
+         CASE WHEN LOWER(handle) = $3 THEN 0
+              WHEN LOWER(handle) LIKE $1 THEN 1
+              ELSE 2
+         END,
+         LENGTH(handle),
+         handle
+       LIMIT $4`,
+      [likePrefix, likeContains, queryNorm, Math.max(1, Math.min(25, limit))]
+    );
+    return rows.map((r) => rowFromPg(r as never));
   }
 
   async isEmailOrHandleTaken(
@@ -232,8 +366,8 @@ export class PgUserStore implements UserStore {
 
   async createUser(row: UserRow): Promise<void> {
     await this.pool.query(
-      `INSERT INTO users (id, email, password_hash, handle, avatar_url, bio, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO users (id, email, password_hash, handle, avatar_url, bio, status, gender, country, interests_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         row.id,
         row.email,
@@ -241,6 +375,10 @@ export class PgUserStore implements UserStore {
         row.handle,
         row.avatarUrl,
         row.bio,
+        row.status,
+        row.gender,
+        row.country,
+        JSON.stringify(row.interests),
         Date.now(),
       ]
     );
@@ -261,6 +399,10 @@ export class PgUserStore implements UserStore {
       handle: "testuser",
       avatarUrl: "",
       bio: "",
+      status: "online",
+      gender: "",
+      country: "",
+      interests: [],
     });
   }
 
@@ -277,7 +419,15 @@ export class PgUserStore implements UserStore {
 
   async applyProfilePatch(
     userId: string,
-    patch: { handle?: string; bio?: string; avatarUrl?: string }
+    patch: {
+      handle?: string;
+      bio?: string;
+      avatarUrl?: string;
+      status?: "online" | "away" | "in_call";
+      gender?: string;
+      country?: string;
+      interests?: string[];
+    }
   ): Promise<UserRow | null> {
     const sets: string[] = [];
     const vals: unknown[] = [];
@@ -293,6 +443,22 @@ export class PgUserStore implements UserStore {
     if (patch.avatarUrl !== undefined) {
       sets.push(`avatar_url = $${i++}`);
       vals.push(patch.avatarUrl);
+    }
+    if (patch.status !== undefined) {
+      sets.push(`status = $${i++}`);
+      vals.push(patch.status);
+    }
+    if (patch.gender !== undefined) {
+      sets.push(`gender = $${i++}`);
+      vals.push(patch.gender);
+    }
+    if (patch.country !== undefined) {
+      sets.push(`country = $${i++}`);
+      vals.push(patch.country);
+    }
+    if (patch.interests !== undefined) {
+      sets.push(`interests_json = $${i++}`);
+      vals.push(JSON.stringify(patch.interests));
     }
     if (sets.length === 0) return this.findById(userId);
     vals.push(userId);
@@ -313,6 +479,28 @@ export class MemoryUserStore implements UserStore {
 
   async findById(id: string): Promise<UserRow | null> {
     return this.byId.get(id) ?? null;
+  }
+
+  async findByHandleNorm(handleNorm: string): Promise<UserRow | null> {
+    for (const u of this.byId.values()) {
+      if (u.handle.trim().toLowerCase() === handleNorm) return u;
+    }
+    return null;
+  }
+
+  async searchByHandle(queryNorm: string, limit: number): Promise<UserRow[]> {
+    if (!queryNorm) return [];
+    const q = queryNorm.toLowerCase();
+    const exact: UserRow[] = [];
+    const prefix: UserRow[] = [];
+    const contains: UserRow[] = [];
+    for (const u of this.byId.values()) {
+      const h = u.handle.trim().toLowerCase();
+      if (h === q) exact.push(u);
+      else if (h.startsWith(q)) prefix.push(u);
+      else if (h.includes(q)) contains.push(u);
+    }
+    return [...exact, ...prefix, ...contains].slice(0, Math.max(1, limit));
   }
 
   async isEmailOrHandleTaken(
@@ -352,19 +540,35 @@ export class MemoryUserStore implements UserStore {
       handle: "testuser",
       avatarUrl: "",
       bio: "",
+      status: "online",
+      gender: "",
+      country: "",
+      interests: [],
     };
     await this.createUser(row);
   }
 
   async applyProfilePatch(
     userId: string,
-    patch: { handle?: string; bio?: string; avatarUrl?: string }
+    patch: {
+      handle?: string;
+      bio?: string;
+      avatarUrl?: string;
+      status?: "online" | "away" | "in_call";
+      gender?: string;
+      country?: string;
+      interests?: string[];
+    }
   ): Promise<UserRow | null> {
     const u = await this.findById(userId);
     if (!u) return null;
     if (patch.handle !== undefined) u.handle = patch.handle;
     if (patch.bio !== undefined) u.bio = patch.bio;
     if (patch.avatarUrl !== undefined) u.avatarUrl = patch.avatarUrl;
+    if (patch.status !== undefined) u.status = patch.status;
+    if (patch.gender !== undefined) u.gender = patch.gender;
+    if (patch.country !== undefined) u.country = patch.country;
+    if (patch.interests !== undefined) u.interests = patch.interests;
     this.byId.set(u.id, u);
     this.byEmail.set(u.email, u);
     return u;
